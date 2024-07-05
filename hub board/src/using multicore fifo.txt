@@ -1,0 +1,503 @@
+
+#include <Arduino.h>
+#include <SPI.h>
+// #include <TMAG5170.h>
+#include <LDC1101.h>
+#include <LVC595.h>
+#include <Wire.h>
+#include "FatFsSd_C.h"
+#include "RP2040.h"
+#include "pico/stdlib.h"
+
+#define null '0'
+
+#define sec 1000
+#define min 60
+#define change_time 60
+#define buffer_size 512
+#define MAX_SAMPLES_PER_BUFFER (BUFFER_SIZE / SAMPLE_SIZE)
+#define FILE_SIZE_LIMIT 31457280 // 30mb // 314572800 // 300 mb // 524288000 bytes = 500 MB in bytes
+
+/*Pins for sd card reader IC*/
+#define SDA 20
+#define SCL 21
+#define RST_pin 22
+#define INT_pin 23
+
+/*CSB pin define*/
+#define MODE_pin 18 // 18
+#define TRIG_pin 17 // 17
+#define Tx_Data_pin 16
+#define Analog_IN_pin 26
+
+/*card reader ic definations*/
+#define Slave_add 113        // 1110001
+#define CR_Reg_add 0x00      // control register address
+#define CF_Reg1_add 0x01     // configure register 1 address
+#define CF_Reg2_add 0x02     // configure register 2 address
+#define CF_Reg3_add 0x03     // configure register 3 address
+#define IE_Reg1_add 0x04     // interrupt enable register 1 address
+#define IE_Reg2_add 0x05     // interrupt enable register 2 address
+#define USBVIDH_add 0x06     // USB vendor ID high byte register address
+#define USBVIDL_add 0x07     // USB vendor ID low byte register address
+#define USBPIDH_add 0x08     // USB product ID high byte register address
+#define USBPIDL_add 0x09     // USB product ID low byte register address
+#define Status_Reg1_add 0x12 // status register1 address
+
+static sd_sdio_if_t sdio_if = {
+    /*
+    Pins CLK_gpio, D1_gpio, D2_gpio, and D3_gpio are at offsets from pin D0_gpio.
+    The offsets are determined by sd_driver\SDIO\rp2040_sdio.pio.
+        CLK_gpio = (D0_gpio + SDIO_CLK_PIN_D0_OFFSET) % 32;
+        As of this writing, SDIO_CLK_PIN_D0_OFFSET is 30,
+            which is -2 in mod32 arithmetic, so:
+        CLK_gpio = D0_gpio -2.
+        D1_gpio = D0_gpio + 1;
+        D2_gpio = D0_gpio + 2;
+        D3_gpio = D0_gpio + 3;
+    */
+    .CMD_gpio = 3,
+    .D0_gpio = 4,
+    .SDIO_PIO = pio1,
+    .DMA_IRQ_num = DMA_IRQ_1,
+    .baud_rate = 15 * 1000 * 1000 // 15 MHz
+};
+// Hardware Configuration of the SD Card "objects"
+static sd_card_t sd_card = {
+    /* "pcName" is the FatFs "logical drive" identifier.
+    (See http://elm-chan.org/fsw/ff/doc/filename.html#vol) */
+    .pcName = "0:",
+    .type = SD_IF_SDIO,
+    .sdio_if_p = &sdio_if,
+    // SD Card detect:
+    .use_card_detect = true,
+    .card_detect_gpio = 8,
+    .card_detected_true = 0, // What the GPIO read returns when a card is present.
+    .card_detect_use_pull = true,
+    .card_detect_pull_hi = true};
+
+extern "C" size_t sd_get_num() { return 1; }
+
+extern "C" sd_card_t *sd_get_by_num(size_t num)
+{
+    if (0 == num)
+        return &sd_card;
+    else
+        return NULL;
+}
+
+#define CHK_FRESULT(s, fr)                                  \
+    if (FR_OK != fr)                                        \
+    {                                                       \
+        printf("%s:%d %s error: %s (%d)\n",                 \
+               __FILE__, __LINE__, s, FRESULT_str(fr), fr); \
+        for (;;)                                            \
+            __breakpoint();                                 \
+    }
+
+unsigned int create_file(unsigned int file_count);
+void collect_data();
+void switchBuffers();
+void get_data();
+
+char cmd;
+
+bool Special32BitEN = 0;
+bool write_status = 0;
+
+bool card_reader_mode = 0;
+bool led_status = 0;
+bool mode_status = 0;
+
+unsigned long previous_millis = 0;
+unsigned long current_millis = millis();
+unsigned long current_second = 0;
+unsigned long previous_second = 0;
+unsigned long previous_micros = 0;
+unsigned long current_micros;
+
+bool current_trig;
+bool previous_trig;
+bool trig_status;
+bool data_available = 0;
+
+// Define Chip Select pins for LDC1101 sensors
+int ldcCsPins[] = {CS12, CS11, CS10, CS9};
+const int numLdcSensors = 4;
+
+int TmagCsPins[] = {CS8, CS7, CS6, CS5, CS4, CS3, CS2, CS1};
+const int numTmagSensors = 8;
+unsigned long x = 0;
+unsigned long y = 0;
+char dummy_buff[512];
+byte buffer1[buffer_size];
+byte buffer2[buffer_size];
+uint8_t *activeBuffer = buffer1;
+uint8_t *standbyBuffer = buffer2;
+size_t activeBufferIndex = 0;
+bool buff_sel = 0;
+bool log_status = 1;
+unsigned int file_count = 0;
+
+int buffer1index = 0;
+int buffer2index = 0;
+ShiftRegister SR;
+MFLSensors Sensors;
+SPISettings SPIset(10000000, MSBFIRST, SPI_MODE0);
+
+sd_card_t *pSD = sd_get_by_num(0);
+FIL file;
+UINT bytes_written;
+FRESULT fr;
+char filename[20]; //= "file1.txt";
+
+DWORD fileSize = 0;
+DWORD sample_count = 0;
+void core1_entry();
+void setup()
+{
+    Serial.begin(115200);
+
+    /*card reader config.*/
+    pinMode(RST_pin, OUTPUT);
+    pinMode(INT_pin, INPUT);
+
+    Wire.setSDA(SDA);
+    Wire.setSCL(SCL);
+    Wire.begin();
+    digitalWrite(RST_pin, HIGH);
+
+    pinMode(LED_BUILTIN, OUTPUT);
+    // for (int i = 0; i < 512; i++)
+    // {
+    //     dummy_buff[i] = 'a';
+    // }
+
+    /*SD card initialise*/
+    fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+    /*check if file exist or not , if file exist then increase file count */
+    snprintf(filename, sizeof(filename), "file%u.txt", file_count);
+    fr = f_open(&file, filename, FA_OPEN_EXISTING);
+    while (fr == FR_OK)
+    {
+        f_close(&file);
+        file_count++;
+        snprintf(filename, sizeof(filename), "file%u.txt", file_count++);
+        fr = f_open(&file, filename, FA_OPEN_EXISTING);
+    }
+    f_close(&file);
+    f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    /* CSB pins config*/
+    pinMode(TRIG_pin, INPUT);
+    pinMode(MODE_pin, INPUT);
+
+    pinMode(Analog_IN_pin, INPUT);
+    SR.LVC595_init();
+    // Serial.begin(115200);
+    Sensors.initSPI(numLdcSensors, numTmagSensors, ldcCsPins, TmagCsPins);
+    // SPI1.begin();
+    // Sensors.dma_setup();
+    /*sensors configure*/
+    // Sensors.dma_setup();
+    Sensors.CheckSensors();
+    Sensors.ConfigureSensors();
+    // Sensors.ConfigureSensors();
+    Sensors.putSensorsInRunMode(1);
+    // SPI1.beginTransaction(SPIset);
+    multicore_launch_core1(core1_entry);
+    digitalWrite(LED_BUILTIN, HIGH);
+}
+unsigned int freq_count = 0;
+
+void loop()
+{
+    if(multicore_fifo_rvalid())
+        data_available = multicore_fifo_pop_blocking();
+    if (data_available == 1)
+    {
+        //  digitalWrite(LED_BUILTIN,HIGH);
+        // if (buff_sel == 1)
+        // {
+        //     fr = f_write(&file, buffer2, sizeof(buffer2), &bytes_written);
+        // }
+        // else
+        // {
+        //     fr = f_write(&file, buffer1, sizeof(buffer1), &bytes_written);
+        // }
+        fr = f_write(&file, standbyBuffer, buffer_size, &bytes_written);
+
+        f_sync(&file); // Ensure data is written
+        data_available = 0;
+        multicore_fifo_drain();
+        if (fr != FR_OK)
+        {
+            digitalWrite(LED_BUILTIN, led_status);
+            // led_status = !led_status;
+            //  Serial.println(fileSize);
+            // Serial.begin(115200);
+            // Serial.print("fail ");
+            // Serial.println(fr);
+            // Serial.print("count ");
+            // Serial.println(freq_count);
+            if (f_close(&file) == FR_OK)
+            {
+                // Serial.println("file closed successfully");
+            }
+            if (f_unmount(pSD->pcName) == FR_OK)
+            {
+                // Serial.println("file unmounted successfully");
+            }
+            if (f_mount(&pSD->fatfs, pSD->pcName, 1) == FR_OK)
+            {
+                // Serial.println("file mounted successfully");
+            }
+            if (f_open(&file, filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK)
+            {
+                // Serial.println("file opened successfully");
+            }
+            if (fr == FR_DISK_ERR)
+                f_printf(&file, "XXXXX_FR_DISK_ERROR_XXXXX");
+            else if (fr == FR_INVALID_OBJECT)
+                f_printf(&file, "XXXXX_FR_INVALID_OBJECT_XXXXX");
+            else
+                f_printf(&file, "XXXXX_FR_ERROR_XXXXX");
+
+            // Serial.end();
+        }
+        else
+        {
+
+            fileSize += bytes_written;
+            if (fileSize >= FILE_SIZE_LIMIT)
+            {
+                f_close(&file); // Close the current file
+                file_count++;
+                file_count = create_file(file_count); // create new file
+            }
+        }
+    }
+
+    if (!mode_status)
+    {
+        if (Serial.available())
+        {
+            cmd = Serial.read();
+            while (Serial.available())
+            {
+                char dump = Serial.read();
+            }
+        }
+        if (cmd == 'S')
+        {
+
+            fr = f_close(&file);
+            // fr = f_unmount(pSD->pcName);
+            log_status = 0;
+            Serial.println("data logging end");
+            Wire.beginTransmission(Slave_add);
+            Wire.write(CR_Reg_add);
+            Wire.write(0x13); // cmd to enable card reader mode and disconnect sd ports from host uc
+            Wire.endTransmission();
+            cmd = null;
+            card_reader_mode = 1;
+            Serial.println("card reader mode activated");
+            previous_millis = millis();
+        }
+    }
+
+    if (card_reader_mode == 1)
+    {
+        // Wire.beginTransmission(Slave_add);
+        // Wire.write(USBVIDH_add);
+        // Wire.endTransmission(0);
+
+        // Wire.requestFrom(Slave_add, 13);
+        // if (Wire.available())
+        // {
+        //     char status_reg1 = Wire.read();
+        // }
+        if ((millis() - previous_millis) > (sec * change_time))
+        {
+            // previous_millis = millis();
+            // current_second++;
+            // // digitalWrite(LED_BUILTIN, led_status);
+            // //  led_status = !led_status;
+            card_reader_mode = 0;
+            Wire.beginTransmission(Slave_add);
+            Wire.write(CR_Reg_add);
+            Wire.write(0x09); // cmd to disable card reader mode and connect sd ports from host uc
+            Wire.endTransmission();
+            // Serial.println("card reader mode de-activated");
+            // fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+            fr = f_open(&file, filename, FA_OPEN_APPEND | FA_WRITE);
+        }
+        // if ((current_second - previous_second) > change_time)
+        // {
+        //     card_reader_mode = 0;
+        //     Wire.beginTransmission(Slave_add);
+        //     Wire.write(CR_Reg_add);
+        //     Wire.write(0x09); // cmd to disable card reader mode and connect sd ports from host uc
+        //     Wire.endTransmission();
+        //     // Serial.println("card reader mode de-activated");
+        //     // fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
+        //     fr = f_open(&file, filename, FA_OPEN_APPEND | FA_WRITE);
+        //     // file_count++;
+        //     // create_file(file_count);
+        // }
+    }
+    // digitalWrite(LED_BUILTIN,LOW);
+}
+
+bool trigger_status = 0;
+
+void Trigger_call()
+{
+    // detachInterrupt(TRIG_pin);
+    // x = micros();
+
+    sample_count++;
+    trigger_status = 1;
+    // Serial.println("trigger");
+
+    // Serial.println(micros()- x);
+}
+
+// void setup1()
+// {
+
+    
+// }
+bool prev_mode_stat = 0;
+bool curr_mode_stat;
+void core1_entry()
+{
+    curr_mode_stat = digitalRead(MODE_pin);
+    if (curr_mode_stat != prev_mode_stat)
+    {
+        mode_status = curr_mode_stat;
+        if (curr_mode_stat)
+        {
+            sample_count = 0;
+            attachInterrupt(TRIG_pin, Trigger_call, RISING);
+            Serial.end();
+        }
+        else
+        {
+            detachInterrupt(TRIG_pin);
+            Serial.begin(115200);
+        }
+        prev_mode_stat = curr_mode_stat;
+    }
+
+    if (card_reader_mode == LOW && trigger_status == 1)
+    {
+        trigger_status = 0;
+        // Sensors.UpdateSensors(1, sample_count);
+        // collect_data();
+        get_data();
+        // if (buff_sel == 1)
+        // {
+        //     // Sensors.dma_fetch_ldcdata(&buffer1[buffer1index], sample_count);
+        //     Sensors.UpdateSensors(1, &buffer1[buffer1index], sample_count);
+        //     buffer1index += SAMPLE_SIZE;
+        // }
+        // else
+        // {
+        //     Sensors.UpdateSensors(1, &buffer2[buffer2index], sample_count);
+        //     buffer2index += SAMPLE_SIZE;
+        // }
+        // if (buffer1index >= buffer_size || buffer2index >= buffer_size) //|| buffer2index >= 384)
+        // {
+        //     while (write_status)
+        //         ;
+        //     buff_sel = !buff_sel;
+        //     buffer1index = 0;
+        //     buffer2index = 0; // 1-0
+        //     data_available = 1;
+        //}
+    }
+}
+unsigned int create_file(unsigned int file_count)
+{
+    snprintf(filename, sizeof(filename), "file%u.txt", file_count);
+    f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    // delayMicroseconds(100);
+    fileSize = 0;
+    return file_count;
+}
+/*** function for split data between two buffer ***/
+void collect_data()
+{
+    size_t availableSpace = buffer_size - activeBufferIndex;
+
+    if (availableSpace >= SAMPLE_SIZE)
+    {
+        // If enough space is available for the entire sample
+        // memcpy(activeBuffer + activeBufferIndex, Sensors.buffer, SAMPLE_SIZE);
+        activeBufferIndex += SAMPLE_SIZE;
+
+        // Check if the buffer is exactly full
+        if (activeBufferIndex == buffer_size)
+        {
+            switchBuffers();
+        }
+    }
+    else
+    {
+        // Not enough space for a full sample
+        // Copy part of the sample into the current buffer
+        if (bytes_written > FILE_SIZE_LIMIT - 520)
+        {
+            switchBuffers();
+        }
+        else
+        {
+            //  memcpy(activeBuffer + activeBufferIndex, Sensors.buffer, availableSpace);
+
+            // Switch buffers
+            switchBuffers();
+
+            // Copy the remainder of the sample into the new active buffer
+            // memcpy(activeBuffer, Sensors.buffer + availableSpace, SAMPLE_SIZE - availableSpace);
+            activeBufferIndex += (SAMPLE_SIZE - availableSpace);
+        }
+    }
+}
+/*** function to collect data ***/
+void get_data()
+{
+    size_t availableSpace = buffer_size - activeBufferIndex;
+
+    if (availableSpace >= SAMPLE_SIZE)
+    {
+        // If enough space is available for the entire sample
+        // memcpy(activeBuffer + activeBufferIndex, Sensors.buffer, SAMPLE_SIZE);
+        Sensors.UpdateSensors(1, activeBuffer + activeBufferIndex, sample_count);
+        activeBufferIndex += SAMPLE_SIZE;
+    }
+    else
+    {
+        switchBuffers();
+        Sensors.UpdateSensors(1, activeBuffer + activeBufferIndex, sample_count);
+        activeBufferIndex += SAMPLE_SIZE;
+    }
+}
+void switchBuffers()
+{
+    //data_available = 1;
+     multicore_fifo_push_blocking(1);
+    // Switch the active and standby buffers
+    if (activeBuffer == buffer1)
+    {
+        activeBuffer = buffer2;
+        standbyBuffer = buffer1;
+    }
+    else
+    {
+        activeBuffer = buffer1;
+        standbyBuffer = buffer2;
+    }
+    activeBufferIndex = 0;
+
+    // Process standbyBuffer here or hand off to another task for processing
+}

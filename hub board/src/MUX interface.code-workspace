@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "MUX interface",
+			"path": "../../MUX interface"
+		},
+		{
+			"name": "240320-105420-arduino-blink",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

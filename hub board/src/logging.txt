@@ -1,0 +1,335 @@
+#include <Arduino.h>
+#include <LDC1101.h>
+#include <Wire.h>
+#include <FatFsSd_C.h>
+
+#define CARD_READER_TIME 60000   // time to turn off the cardreader mode in milliseconds
+#define BAUDRATE 115200          // serial port baudrate
+#define BUFFER_SIZE (32*1024)         // buffer size of 1 sample packet
+#define FILE_SIZE_LIMIT 31457280 // 30mb
+
+/*Pins for sd card reader IC*/
+#define SDA 20
+#define SCL 21
+#define RST_pin 22
+#define INT_pin 23
+
+/*CSB pin define*/
+#define MODE_pin 18 // 18
+#define TRIG_pin 17 // 17
+#define Tx_Data_pin 16
+#define Analog_IN_pin 26
+
+/*card reader ic definations*/
+#define Slave_add 113        // 1110001
+#define CR_Reg_add 0x00      // control register address
+#define CF_Reg1_add 0x01     // configure register 1 address
+#define CF_Reg2_add 0x02     // configure register 2 address
+#define CF_Reg3_add 0x03     // configure register 3 address
+#define IE_Reg1_add 0x04     // interrupt enable register 1 address
+#define IE_Reg2_add 0x05     // interrupt enable register 2 address
+#define USBVIDH_add 0x06     // USB vendor ID high byte register address
+#define USBVIDL_add 0x07     // USB vendor ID low byte register address
+#define USBPIDH_add 0x08     // USB product ID high byte register address
+#define USBPIDL_add 0x09     // USB product ID low byte register address
+#define Status_Reg1_add 0x12 // status register1 address
+
+static sd_sdio_if_t sdio_if = {
+    /*
+    Pins CLK_gpio, D1_gpio, D2_gpio, and D3_gpio are at offsets from pin D0_gpio.
+    The offsets are determined by sd_driver\SDIO\rp2040_sdio.pio.
+        CLK_gpio = (D0_gpio + SDIO_CLK_PIN_D0_OFFSET) % 32;
+        As of this writing, SDIO_CLK_PIN_D0_OFFSET is 30,
+            which is -2 in mod32 arithmetic, so:
+        CLK_gpio = D0_gpio -2.
+        D1_gpio = D0_gpio + 1;
+        D2_gpio = D0_gpio + 2;
+        D3_gpio = D0_gpio + 3;
+    */
+    .CMD_gpio = 3,
+    .D0_gpio = 4,
+    .SDIO_PIO = pio1,
+    .DMA_IRQ_num = DMA_IRQ_1,
+    .baud_rate = 15 * 1000 * 1000 // 15 MHz
+};
+// Hardware Configuration of the SD Card "objects"
+static sd_card_t sd_card = {
+    /* "pcName" is the FatFs "logical drive" identifier.
+    (See http://elm-chan.org/fsw/ff/doc/filename.html#vol) */
+    .pcName = "0:",
+    .type = SD_IF_SDIO,
+    .sdio_if_p = &sdio_if,
+    // SD Card detect:
+    .use_card_detect = true,
+    .card_detect_gpio = 8,
+    .card_detected_true = 0, // What the GPIO read returns when a card is present.
+    .card_detect_use_pull = true,
+    .card_detect_pull_hi = true};
+
+extern "C" size_t sd_get_num() { return 1; }
+
+extern "C" sd_card_t *sd_get_by_num(size_t num)
+{
+    if (0 == num)
+        return &sd_card;
+    else
+        return NULL;
+}
+
+/*variables for file*/
+FIL file;
+FRESULT fr;
+sd_card_t *ptr = &sd_card;
+
+uint8_t buffer1[BUFFER_SIZE];
+uint8_t buffer2[BUFFER_SIZE];
+uint8_t *activebufffer = buffer1;
+uint8_t *standbybuffer = buffer2;
+int activeBufferIndex = 0;
+
+char filename[20];
+unsigned int fileCount = 0;
+UINT bw = 0;
+DWORD fileSize = 0;
+unsigned long previous_millis = 0, current_millis = 0;
+
+/**variables for sensor */
+MFLSensors Sensors;
+const int numLDC = 4;
+const int LDCpins[] = {CS12, CS11, CS10, CS9};
+
+const int numTMAG = 8;
+const int TMAGpins[] = {CS8, CS7, CS6, CS5, CS4, CS3, CS2, CS1};
+
+bool trig_status = 0, data_available = 0, card_reader_mode = 0;
+bool current_mode, prev_mode = 0;
+DWORD sample_count = 0;
+
+void check_mode();
+void get_data();
+void switch_buffer();
+void create_file();
+void trigger();
+void sd_card_init();
+void card_reader_mode_on();
+void card_reader_mode_off();
+void CR_init();
+
+void setup()
+{
+    pinMode(TRIG_pin, OUTPUT);
+    pinMode(MODE_pin, OUTPUT);
+    pinMode(Analog_IN_pin, INPUT);
+    pinMode(LED_BUILTIN, OUTPUT);
+    /*card reader config.*/
+    CR_init();
+
+    Sensors.initSPI(numLDC, numTMAG, LDCpins, TMAGpins);
+    Sensors.CheckSensors();
+    Sensors.ConfigureSensors();
+    Sensors.putSensorsInRunMode(1);
+    
+}
+void loop()
+{
+    check_mode();
+    if (trig_status == 1 && card_reader_mode == 0)
+    {
+        trig_status = 0;
+        get_data();
+        digitalWrite(LED_BUILTIN,trig_status);
+    }
+    if(!prev_mode)
+    {
+        char  cmd;
+        if(Serial.available())
+        {
+           cmd  = Serial.read();
+        }
+        while(Serial.available())
+        {
+            char dump = Serial.read();
+        }
+        if(cmd == 'S')
+        {
+            card_reader_mode_on();
+            cmd = '0';
+        }
+        
+    }
+    if(card_reader_mode)
+    {
+        card_reader_mode_off();
+    }
+}
+char buff[512];
+void setup1()
+{
+    
+    sd_card_init();
+    for(int i=0;i<512;i++)
+    {
+        buff[i] = 'a';
+    }
+    digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void loop1()
+{
+    if (rp2040.fifo.available())
+    {
+       // digitalWrite(LED_BUILTIN,HIGH);
+        data_available = rp2040.fifo.pop();
+    }
+    if (1)
+    {
+        //fr = f_write(&file, standbybuffer, BUFFER_SIZE, &bw);
+        fr = f_write(&file, buff, 512, &bw);
+        f_sync(&file);
+        data_available = 0;
+        rp2040.fifo.clear();
+        //digitalWrite(LED_BUILTIN,LOW);
+        if (fr != FR_OK)
+        {
+            digitalWrite(LED_BUILTIN, LOW);
+            Serial.println("fr  not ok");
+            Serial.print(fr);
+        }
+        else
+        {
+            fileSize += bw;
+            if (fileSize >= FILE_SIZE_LIMIT)
+            {
+                create_file();
+            }
+        }
+    }
+    
+}
+
+void check_mode()
+{
+    current_mode = digitalRead(MODE_pin);
+    if (prev_mode != current_mode)
+    {
+        if (current_mode)
+        {
+            sample_count = 0;
+            attachInterrupt(TRIG_pin, trigger, FALLING);
+            // card_reader_mode_off();
+            // delay(100);
+            Serial.end();
+        }
+        else
+        {
+            detachInterrupt(TRIG_pin);
+            //card_reader_mode_on();
+            Serial.begin(BAUDRATE);
+        }
+        prev_mode = current_mode;
+    }
+}
+void get_data()
+{
+    size_t available_space = BUFFER_SIZE - activeBufferIndex;
+
+    if (available_space >= SAMPLE_SIZE)
+    {
+        Sensors.UpdateSensors(1, activebufffer + activeBufferIndex, sample_count);
+        activeBufferIndex += SAMPLE_SIZE;
+    }
+    else
+    {
+        switch_buffer();
+        Sensors.UpdateSensors(1, activebufffer + activeBufferIndex, sample_count);
+        activeBufferIndex += SAMPLE_SIZE;
+    }
+}
+
+void switch_buffer()
+{
+    if (activebufffer == buffer1)
+    {
+        activebufffer = buffer2;
+        standbybuffer = buffer1;
+    }
+    else
+    {
+        activebufffer = buffer1;
+        standbybuffer = buffer2;
+    }
+    activeBufferIndex = 0;
+    rp2040.fifo.clear();
+    rp2040.fifo.push_nb(1) ;
+        
+}
+void create_file()
+{
+    f_close(&file);
+    fileCount++;
+    snprintf(filename, sizeof(filename), "file%u.txt", fileCount);
+    f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    fileSize = 0;
+}
+void trigger()
+{
+    sample_count++;
+    trig_status = 1;
+    digitalWrite(LED_BUILTIN,trig_status);
+}
+
+void sd_card_init()
+{
+    /*sd card init*/
+    f_mount(&ptr->fatfs, ptr->pcName, 1);
+    snprintf(filename, sizeof(filename), "file%u", fileCount);
+    fr = f_open(&file, filename, FA_OPEN_EXISTING);
+    while (fr == FR_OK)
+    {
+        f_close(&file);
+        fileCount++;
+        snprintf(filename, sizeof(filename), "file%u.txt", fileCount++);
+        fr = f_open(&file, filename, FA_OPEN_EXISTING);
+    }
+    f_close(&file);
+    f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+}
+
+void card_reader_mode_on()
+{
+    fr = f_close(&file);
+    Wire.beginTransmission(Slave_add);
+    Wire.write(CR_Reg_add);
+    Wire.write(0x13); // cmd to enable card reader mode and disconnect sd ports from host uc
+    Wire.endTransmission();
+    card_reader_mode = 1;
+    previous_millis = millis();
+    Serial.println("card reader mode activated");
+}
+
+void card_reader_mode_off()
+{
+
+    if(millis() - previous_millis >= CARD_READER_TIME)
+    {
+
+   
+        card_reader_mode = 0;
+        Wire.beginTransmission(Slave_add);
+        Wire.write(CR_Reg_add);
+        Wire.write(0x09); // cmd to disable card reader mode and connect sd ports from host uc
+        Wire.endTransmission();
+        fr = f_open(&file, filename, FA_OPEN_APPEND | FA_WRITE);
+     }
+}
+
+void CR_init()
+{
+    pinMode(RST_pin, OUTPUT);
+    pinMode(INT_pin, INPUT);
+
+    Wire.setSDA(SDA);
+    Wire.setSCL(SCL);
+    Wire.begin();
+    digitalWrite(RST_pin, HIGH);
+}
